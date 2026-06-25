@@ -230,3 +230,6 @@ context = torch.zeros((1, 1), dtype=torch.long, device=device)
 for i in range(5):
     print(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
     print("-"*100)
+
+torch.save(m.state_dict(), 'shakespeare_gpt.pt')
+print("Model saved.")
