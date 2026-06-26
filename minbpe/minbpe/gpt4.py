@@ -51,6 +51,8 @@ GPT4_SPECIAL_TOKENS = {
 
 
 class GPT4Tokenizer(RegexTokenizer):
+    """ Really just a wrapper around RegexTokenizer that initializes it with the GPT-4 merges."""
+
     def __init__(self):
         super().__init__(pattern=GPT4_SPLIT_PATTERN)
         # Get the official tokenizer and its merges
