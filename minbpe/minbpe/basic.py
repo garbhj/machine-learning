@@ -1,11 +1,11 @@
-from .base import merge, get_stats
+from .base import merge, get_stats, Tokenizer
 
 
-class BasicTokenizer:
+class BasicTokenizer(Tokenizer):
 
     def __init__(self):
-        pass
-        
+        super().__init__()
+
     def train(self, text, vocab_size, verbose=False):
         # Given a string, create a vocabulary
         assert vocab_size >= 256
