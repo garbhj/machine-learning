@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -32,10 +33,12 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -47,12 +50,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        # attention (materializes the large (T,T) matrix for all the queries and keys)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -1e5)  # Work better with mps?
+        att = F.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
         return y
-
 
 class MLP(nn.Module):
     """ A simple feed-forward block in a Transformer """
@@ -74,7 +81,6 @@ class Block(nn.Module):
     """ Transformer block: Communication followed by computation """
 
     def __init__(self, config):
-        # n_embd = n_head * head_size
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -104,7 +110,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -179,6 +185,7 @@ class GPT(nn.Module):
         return model
 
 # ---------------------------------------------------------------------------
+device = 'cpu'  # Because mps seems to have issue with optimizing with zero gradients
 print("using device:", device)
 
 # Get a data batch
@@ -190,17 +197,23 @@ text = text[:1000]
 tokens = enc.encode(text)
 B, T = 4, 32
 buf = torch.tensor(tokens[:B*T + 1])  # +1 for offset of y
+buf = buf.to(device)
 x = buf[:-1].view(B, T)  # (B, T)
 y = buf[1:].view(B, T)  # (B, T)
-x = x.to(device)
-y = y.to(device)
 
 # get logits
 model = GPT(GPTConfig())  # initialize new model
 model.to(device)
-logits, loss = model(x, y)
 
-print(loss)
+# Optimize:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y) 
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
 import sys; sys.exit(0)
 
 
