@@ -124,10 +124,10 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        # loss = None
-        # if targets is not None:
-        #     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits#, loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # (B*T, V), (B*T)
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -181,17 +181,33 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 print("using device:", device)
 
-num_return_sequences = 5
-max_length = 30
-
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
-model.eval()
-model.to(device)
-
-# prefix tokens
+# Get a data batch
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])  # +1 for offset of y
+x = buf[:-1].view(B, T)  # (B, T)
+y = buf[1:].view(B, T)  # (B, T)
+x = x.to(device)
+y = y.to(device)
+
+# get logits
+model = GPT(GPTConfig())  # initialize new model
+model.to(device)
+logits, loss = model(x, y)
+
+print(loss)
+import sys; sys.exit(0)
+
+
+# Evaluate model
+model.eval()
+num_return_sequences = 5
+max_length = 30
 tokens = enc.encode("Hello, I'm a language model,")  # 8 tokens
 tokens = torch.tensor(tokens, dtype=torch.long)  # (8, )
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
