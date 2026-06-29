@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For after torch.compile, smth goes wrong with libomp.dylib
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For after torch.compile, smth goes wrong with libomp.dylib in my conda env
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -54,11 +54,17 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -1e5)  # Work better with mps?
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -1e5)  # Work better with mps? Still something wrong that stops even single batch from converging
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # q = q.contiguous()
+        # k = k.contiguous()
+        # v = v.contiguous()
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -239,6 +245,38 @@ class DataLoaderLite:
 
 
 
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# get logits
+model = GPT(GPTConfig())
+model.to(device)
+
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+import sys; sys.exit(0)
+
+
+
+
+
 # ---------------------------------------------------------------------------
 
 import time
@@ -271,7 +309,7 @@ for i in range(50):
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # Only for ampere series 
-    #     logits, loss = model(x, y)  khhhhhhhhhhggfdfjkl;;;;;;;l,,,,,                                                                                                                                                                                                                                                          
+    #     logits, loss = model(x, y)                                                                                                                                                                                                                                           
     logits, loss = model(x, y) 
     loss.backward()
     optimizer.step()
@@ -280,6 +318,7 @@ for i in range(50):
     dt = (t1-t0)*1000  # Time difference in ms
     tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0) 
     print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tps: {tokens_per_sec:.2f}")
+    # torch.mps.empty_cache()
 
 import sys; sys.exit(0)
 
