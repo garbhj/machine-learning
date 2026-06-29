@@ -123,12 +123,12 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Weight sharing scheme
-        # self.transformer.wte.weight = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight
 
         # Parameter init
-        # self.apply(self._init_weights)  # torch.nn.Module.apply(fn) to all submodules 
+        self.apply(self._init_weights)  # torch.nn.Module.apply(fn) to all submodules 
 
-        # (NOTE: Both weight tying and parameter init stop us from overfitting on a single sample)
+        # (NOTE: Both weight tying and parameter init stop us from overfitting on a single sample, also overfitting only ever happens on cpu only)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -242,48 +242,6 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
-
-
-# TEST: ovefit on a single batch
-device="cpu"  # overfit works on cpu
-print(device)
-
-torch.manual_seed(1337)
-if torch.mps.is_available():
-    torch.mps.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
-
-# get logits
-model = GPT(GPTConfig())
-model.to(device)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
-    optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
-    optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
-
-import sys; sys.exit(0)
-
-
-
-
-
 # ---------------------------------------------------------------------------
 
 import time
@@ -299,7 +257,7 @@ if torch.cuda.is_available():
 
 train_loader = DataLoaderLite(B=4, T=1024)
 
-torch.set_float32_matmul_precision('medium')  # Originally highest, only works on cuda
+torch.set_float32_matmul_precision('medium')  # Originally highest, only does something on cuda but won't crash on mps
 
 # Initialize Model
 model = GPT(GPTConfig())  # initialize new model
@@ -315,7 +273,7 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # Only for ampere series 
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # Only for ampere series and onward
     #     logits, loss = model(x, y)                                                                                                                                                                                                                                           
     logits, loss = model(x, y) 
     loss.backward()
@@ -325,7 +283,7 @@ for i in range(50):
     dt = (t1-t0)*1000  # Time difference in ms
     tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0) 
     print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tps: {tokens_per_sec:.2f}")
-    # torch.mps.empty_cache()
+    # torch.mps.empty_cache()  # no effect
 
 import sys; sys.exit(0)
 
