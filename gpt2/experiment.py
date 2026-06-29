@@ -1,7 +1,5 @@
 import math
 from dataclasses import dataclass
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For after torch.compile, smth goes wrong with libomp.dylib in my conda env
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -35,7 +33,6 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -54,14 +51,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -1e5)  # Work better with mps? Still something wrong that stops even single batch from converging
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -1e5)  # Work better with mps?
+        att = F.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -75,7 +69,6 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh') 
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -121,25 +114,6 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # Weight sharing scheme
-        # self.transformer.wte.weight = self.lm_head.weight
-
-        # Parameter init
-        # self.apply(self._init_weights)  # torch.nn.Module.apply(fn) to all submodules 
-
-        # (NOTE: Both weight tying and parameter init stop us from overfitting on a single sample)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            std = 0.02
-            if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std *= (2 * self.config.n_layer) ** -0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        if isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -211,49 +185,10 @@ class GPT(nn.Module):
         return model
 
 # ---------------------------------------------------------------------------
-import tiktoken
+device = 'cpu'  # Because mps seems to have issue with optimizing with zero gradients
+print("using device:", device)
 
-class DataLoaderLite:
-    def __init__(self, B, T):
-        self.B = B
-        self.T = T
-
-        # At init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-
-        # State
-        self.current_position = 0
-
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # Advance the position in the tensor
-        self.current_position += B * T
-        # If loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
-        return x, y
-
-
-
-# TEST: ovefit on a single batch
-device="cpu"  # overfit works on cpu
-print(device)
-
-torch.manual_seed(1337)
-if torch.mps.is_available():
-    torch.mps.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
+# Get a data batch
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
 with open('input.txt', 'r') as f:
@@ -261,75 +196,25 @@ with open('input.txt', 'r') as f:
 text = text[:1000]
 tokens = enc.encode(text)
 B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
+buf = torch.tensor(tokens[:B*T + 1])  # +1 for offset of y
 buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+x = buf[:-1].view(B, T)  # (B, T)
+y = buf[1:].view(B, T)  # (B, T)
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig())  # initialize new model
 model.to(device)
 
+# Optimize:
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    logits, loss = model(x, y) 
     loss.backward()
     optimizer.step()
     print(f"step {i}, loss: {loss.item()}")
 
 import sys; sys.exit(0)
-
-
-
-
-
-# ---------------------------------------------------------------------------
-
-import time
-
-# device = 'cpu'  # Because mps seems to have issue with optimizing with zero gradients
-print("using device:", device)
-
-torch.manual_seed(1337)
-if torch.mps.is_available():
-    torch.mps.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-train_loader = DataLoaderLite(B=4, T=1024)
-
-torch.set_float32_matmul_precision('medium')  # Originally highest, only works on cuda
-
-# Initialize Model
-model = GPT(GPTConfig())  # initialize new model
-model.to(device)
-print("Starting Compilation")
-model = torch.compile(model)
-print("Finished Compilation")
-
-# Optimize:
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
-    t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # Only for ampere series 
-    #     logits, loss = model(x, y)                                                                                                                                                                                                                                           
-    logits, loss = model(x, y) 
-    loss.backward()
-    optimizer.step()
-    torch.mps.synchronize()
-    t1 = time.time()
-    dt = (t1-t0)*1000  # Time difference in ms
-    tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0) 
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tps: {tokens_per_sec:.2f}")
-    # torch.mps.empty_cache()
-
-import sys; sys.exit(0)
-
-# ---------------------------------------------------------------------------
 
 
 # Evaluate model
