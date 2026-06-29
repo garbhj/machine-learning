@@ -1,5 +1,7 @@
 import math
 from dataclasses import dataclass
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For after torch.compile, smth goes wrong with libomp.dylib
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -239,7 +241,9 @@ class DataLoaderLite:
 
 # ---------------------------------------------------------------------------
 
-device = 'cpu'  # Because mps seems to have issue with optimizing with zero gradients
+import time
+
+# device = 'cpu'  # Because mps seems to have issue with optimizing with zero gradients
 print("using device:", device)
 
 torch.manual_seed(1337)
@@ -248,22 +252,34 @@ if torch.mps.is_available():
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=1024)
+
+torch.set_float32_matmul_precision('medium')  # Originally highest, only works on cuda
 
 # Initialize Model
 model = GPT(GPTConfig())  # initialize new model
 model.to(device)
+print("Starting Compilation")
+model = torch.compile(model)
+print("Finished Compilation")
 
 # Optimize:
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16):  # Only for ampere series 
+    #     logits, loss = model(x, y)  khhhhhhhhhhggfdfjkl;;;;;;;l,,,,,                                                                                                                                                                                                                                                          
     logits, loss = model(x, y) 
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.mps.synchronize()
+    t1 = time.time()
+    dt = (t1-t0)*1000  # Time difference in ms
+    tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0) 
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tps: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
