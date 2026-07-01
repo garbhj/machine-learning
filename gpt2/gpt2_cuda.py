@@ -231,7 +231,7 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, device):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -243,7 +243,8 @@ class DataLoaderLite:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
+        # self.tokens = torch.tensor(tokens)
+        self.tokens = torch.tensor(tokens, dtype=torch.long, device=device)  # directly to GPU
         if master_process:
             print(f"loaded {len(self.tokens)} tokens")
             print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
@@ -312,7 +313,7 @@ if master_process:
 
 print(f"GPU {ddp_rank} | device {device} | online")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, device=device)
 
 # torch.set_float32_matmul_precision('medium')  # Originally highest, only does something on ampere+ cuda but won't crash on mps or t4
 
@@ -322,11 +323,14 @@ model.to(device)
 
 # Wrap in DDP
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
-
+    ddp_model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = ddp_model.module 
+else:
+    ddp_model = model
+    raw_model = model
+    
 # Compile Model
-model = torch.compile(model)
+model = torch.compile(ddp_model)
 # dummy_input = torch.zeros((16, 10), dtype=torch.long, device=device)
 # model(dummy_input)
 # torch.cuda.synchronize()
@@ -361,11 +365,11 @@ scaler = torch.amp.GradScaler('cuda')
 # Training Block
 for step in range(max_steps):
     t0 = time.time()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)  # slightly faster?
     loss_accum = 0.0
     for microstep in range(grad_accum_steps):
         x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+        # x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device, dtype=torch.float16):  # bfloat16 only for ampere series and onward
             logits, loss = model(x, y)
         # logits, loss = model(x, y)
@@ -375,9 +379,9 @@ for step in range(max_steps):
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        print_loss = loss.detach().item() * grad_accum_steps 
+        # print_loss = loss.detach().item() * grad_accum_steps 
         if ddp:
-            model.require_backward_grad_sync = (microstep == grad_accum_steps - 1)
+            ddp_model.require_backward_grad_sync = (microstep == grad_accum_steps - 1)
         scaler.scale(loss).backward()  # needed due to fp16 lower range than bf16
         # print(f"microbatch {microstep} | step loss: {print_loss:.6f}")
     if ddp:
